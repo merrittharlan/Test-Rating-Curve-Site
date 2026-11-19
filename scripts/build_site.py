@@ -216,7 +216,7 @@ def layout(cfg: dict, title: str, body: str, root: str, active: str = "") -> str
 <p>{esc(s.get('intro', ''))}</p></div>
 <div><h4>Data</h4><ul><li><a href="https://waterdata.usgs.gov/">USGS Water Data</a></li>
 <li><a href="https://github.com/thodson-usgs/ratingcurve">ratingcurve</a> (<a href="https://doi.org/10.3390/hydrology11020014">Hodson et al., 2024</a>)</li>
-<li>Basemap © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, © <a href="https://carto.com/attributions">CARTO</a></li></ul></div>
+<li>Basemap: <a href="https://www.usgs.gov/programs/national-geospatial-program/national-map">USGS The National Map</a></li></ul></div>
 <div><h4>About</h4><p>{esc(s.get('disclaimer', ''))}</p><p class="muted">Built {built}.</p></div>
 </div></footer>
 <script src="{root}assets/vendor/leaflet/leaflet.js"></script>
