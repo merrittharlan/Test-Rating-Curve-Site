@@ -1,4 +1,5 @@
 ratingcurve>=1.1
+dataretrieval>=1.4
 matplotlib
 pandas
 pyyaml

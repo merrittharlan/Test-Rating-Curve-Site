@@ -1,79 +1,104 @@
-# Streamflow Rating Curves on GitHub Pages
+# Mass River Flow — a rating-curve website demo
 
-This repo fits stage–discharge rating curves with the USGS
-[`ratingcurve`](https://github.com/thodson-usgs/ratingcurve) package (a segmented power law fit
-with PyMC) and publishes the results as a website. Each time you push new measurements, a GitHub
-Action refits every site and redeploys the site.
+A prototype website that turns water levels into streamflow for a network of river gauges. When the
+site is built (on each push, or from the Actions tab), a GitHub Action:
 
-Each gage gets its own page with:
-- the fitted rating curve, its uncertainty band, and the measurements
-- a residuals plot for checking the fit
-- fitted parameters in real units (intercept, exponents, breakpoints) with 95% intervals
-- a rating table (median, mean, ≈95% range), with downloads as CSV, JSON, and the full posterior (NetCDF)
+1. downloads water levels and flow measurements for each gauge. The prototype uses USGS streamgauges
+   as stand-ins for logger data, via [`dataretrieval`](https://github.com/DOI-USGS/dataretrieval-python).
+2. fits a rating curve for each gauge with [`ratingcurve`](https://github.com/thodson-usgs/ratingcurve)
+   (a Bayesian segmented power law),
+3. converts water levels to streamflow with an uncertainty range, with zero flow when the stream is dry,
+4. publishes the site to GitHub Pages.
 
-## One-time setup
+**Home page:** a map and list of gauges, a "Visit a staff gauge" section with a link for submitting
+readings, and a short "how it works" section.
 
-1. Create a new GitHub repository (for example `rating-curves`) and push these files to `main`:
-   ```bash
-   git init && git add . && git commit -m "Rating curve site"
-   git branch -M main
-   git remote add origin https://github.com/<you>/rating-curves.git
-   git push -u origin main
-   ```
-2. On GitHub, go to **Settings → Pages → Build and deployment → Source** and choose **GitHub Actions**.
-3. Open the **Actions** tab. If the first run started before you changed the Pages setting, click
-   **Fit rating curves and publish site → Run workflow**. A run takes about 3–5 minutes (mostly
-   installing PyMC) plus about 30 seconds per site.
-4. Your site will be at `https://<you>.github.io/rating-curves/`.
+**Gauge pages:** gauge info (including no-flow days), a staff-gauge box, a map, streamflow and
+water-level charts with time-range buttons, the rating curve and its parameters, and CSV/JSON downloads.
 
-## Adding your own gage
+> This is a concept demo, not an official Massachusetts Rivers Alliance product. The footer says so.
 
-1. Put a CSV in `data/` with these columns (the header names matter, the order doesn't):
+## Setup
 
-   | column     | required | meaning                                        |
-   |------------|----------|------------------------------------------------|
-   | `stage`    | yes      | gage height                                    |
-   | `q`        | yes      | measured discharge                             |
-   | `q_sigma`  | no       | 1-σ uncertainty of each measurement (same units as `q`) |
-   | `datetime` | no       | shown in the measurement table only            |
+1. Push these files to the `main` branch of a GitHub repository, including the hidden `.github` folder.
+2. **Settings → Pages → Build and deployment → Source: GitHub Actions.** Don't pick one of
+   GitHub's suggested workflows. The workflow is already in `.github/workflows/build-ratings.yml`.
+3. Open the **Actions** tab. The push starts a run; if not, click **Run workflow**.
+   A run takes about 6–10 minutes.
+4. The site is at `https://<user>.github.io/<repo>/`.
 
-2. Add an entry to `sites.yml`:
-   ```yaml
-   - id: my-creek            # used in the URL
-     name: My Creek near Town
-     file: data/my_creek.csv
-     segments: 2             # number of power-law segments (control changes)
-   ```
-3. Commit and push. The Action refits and redeploys.
+The site rebuilds on every push, for example after new logger data are added. To rebuild by hand,
+click **Actions → Fit rating curves and publish site → Run workflow**.
 
-You can delete the two demo sites (Green River and Provo River, from the package's test data)
-whenever you like. Stage and discharge units are set once at the top of `sites.yml`.
+**Staff-gauge readings:** set `submit_url` at the top of `sites.yml` to a form (a Google Form works)
+so the "Submit a reading" buttons go somewhere. Until then they're grayed out. Each gauge can also have
+a `staff_gauge:` line describing where to find the gauge.
 
-**Choosing `segments`:** start with 1 or 2. If the residuals plot bends across a stage range, add a
-segment. If a breakpoint's 95% interval is very wide or sits where you have no data, use fewer.
-Five or more measurements are needed. A good fit usually needs measurements across the whole stage range.
+**Optional — USGS API key:** without a key, USGS limits how many requests you can make per hour.
+That's plenty for a handful of gauges. For more, get a free key at https://api.waterdata.usgs.gov/signup/
+and add it as a repository secret named `API_USGS_PAT` (**Settings → Secrets and variables → Actions**).
+
+## Adding or changing gauges
+
+Edit `sites.yml`:
+
+```yaml
+sites:
+  - usgs_id: "01104500"          # USGS site number (keep the quotes and leading zero)
+    name: Charles River at Waltham
+    river: Charles River
+    region: Greater Boston
+    segments: 2                  # optional; overrides the default
+    measurements_since: "2018-10-01"   # optional
+```
+
+Find site numbers on https://waterdata.usgs.gov/. Pick gauges that report gage height and have field
+measurements. Most continuous streamgauges do.
+
+- `segments`: the number of power-law segments (control changes). Start with 2. Add one if the fitted
+  curve misses a bend in the measurements; use 1 if the second breakpoint's interval is very wide.
+- `measurements_since`: rating curves shift as channels change. Using only the last ~10 years of
+  measurements keeps the fit close to the current channel. Shorten it if the fit disagrees with
+  recent measurements.
+
+The site title, tagline, intro, disclaimer, and units are at the top of `sites.yml`.
+
+If a gage fails (no measurements, a USGS outage), the rest of the site still publishes. The gage's card
+appears in the list with the error, and the Actions run shows a warning.
 
 ## Running locally
 
 ```bash
 pip install -r requirements.txt
-python scripts/build_site.py              # all sites -> _site/
-python scripts/build_site.py --only my-creek
-python -m http.server -d _site 8000       # open http://localhost:8000
+python scripts/fetch_usgs.py        # downloads into data/usgs/
+python scripts/build_site.py        # writes _site/
+python -m http.server -d _site 8000 # open http://localhost:8000
 ```
 
-If one site fails (bad CSV, too few points), the rest still publish. The failed site appears on the
-home page with its error, and the Action shows a warning.
+## How the numbers are made
 
-## Notes
+- **Rating curve:** `ln(Q) = a + Σ bᵢ · ln(max(h − hsᵢ, 0) + hoᵢ)`, fitted with ADVI and a fixed random seed.
+  Measurement uncertainty comes from the measurement's quality rating when one is available, otherwise 5%.
+- **Dry streams:** flow is 0 whenever the water level is at or below hs0, the fitted zero-flow stage.
+  Dry site visits (flow = 0) are counted, but a power law can't be fitted to them, so they aren't
+  used in the fit.
+- **Streamflow:** the daily water level run through the rating. The ~95% range is median ÷ GSE² to
+  median × GSE².
 
-- Fits use ADVI (the package default) with a fixed random seed (`--seed`), so reruns on the same
-  data give the same results.
-- Rating tables extend 10% above the highest measurement. Treat that extrapolation with caution.
-- Results are provisional and should be reviewed by a hydrographer before operational use.
+## Files
 
-## Citation
+```
+sites.yml                       gauges and site text
+scripts/fetch_usgs.py           USGS download
+scripts/build_site.py           fitting + page generation
+site_assets/site.css, site.js   styles, maps, charts
+site_assets/vendor/             Leaflet, Chart.js (bundled; their licenses are alongside)
+.github/workflows/              GitHub Actions workflow
+```
+
+## Credits
 
 Hodson, T.O., Doore, K.J., Kenney, T.A., Over, T.M., and Yeheyis, M.B., 2024, Ratingcurve: A Python
 package for fitting streamflow rating curves: *Hydrology*, v. 11, no. 2, p. 14,
-https://doi.org/10.3390/hydrology11020014
+https://doi.org/10.3390/hydrology11020014. Data: U.S. Geological Survey. Basemap © OpenStreetMap
+contributors, © CARTO.

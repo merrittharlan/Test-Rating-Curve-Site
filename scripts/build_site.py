@@ -1,10 +1,14 @@
-"""Fit a rating curve for every site in sites.yml and write a static website.
+"""Fit a rating curve for every gage and build the website.
+
+Reads the files written by scripts/fetch_usgs.py (data/usgs/<site_no>/) and writes _site/:
+    index.html                      home page: map + gauge cards
+    gauges/<site_no>/index.html     gauge page: info, map, flow/level charts, rating curve
+    gauges/<site_no>/*.csv|json     downloads
+    assets/                         CSS, JS and vendored Leaflet / Chart.js
 
 Usage:
-    python scripts/build_site.py                # reads sites.yml, writes _site/
-    python scripts/build_site.py --config sites.yml --out _site --only green-channel
-
-Uses the USGS `ratingcurve` package (segmented power law, fit with PyMC).
+    python scripts/fetch_usgs.py && python scripts/build_site.py
+    python scripts/build_site.py --only 01104500
 """
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import math
 import shutil
 import sys
 import traceback
@@ -20,7 +25,6 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import yaml  # noqa: E402
@@ -32,23 +36,12 @@ ROOT = Path(__file__).resolve().parent.parent
 esc = html.escape
 
 
-# --------------------------------------------------------------------------- data
-def load_measurements(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-    missing = {"stage", "q"} - set(df.columns)
-    if missing:
-        raise ValueError(f"{path.name} is missing required column(s): {', '.join(sorted(missing))}")
-    df = df.dropna(subset=["stage", "q"])
-    df = df[df["q"] > 0]
-    if len(df) < 5:
-        raise ValueError(f"{path.name} has only {len(df)} usable measurements; need at least 5")
-    return df.sort_values("stage").reset_index(drop=True)
-
-
-# --------------------------------------------------------------------------- fitting
+# =========================================================================== modelling
 def posterior_params(rating: PowerLawRating) -> list[dict]:
-    """Posterior mean, SD and 95% interval of a, b_i, hs_i in real units."""
+    """Posterior mean, SD and 95% interval of a, b_i, hs_i in real units.
+
+    ln(Q) = a + sum_i b_i * ln(max(h - hs_i, 0) + ho_i), ho_0 = 0, ho_i = 1 for i > 0
+    """
     post = rating.idata.posterior
     mu, std = float(rating.q_transform.mean_), float(rating.q_transform.std_)
     draws = {"a": mu + std * post["a"].values.reshape(-1)}
@@ -58,223 +51,358 @@ def posterior_params(rating: PowerLawRating) -> list[dict]:
     for i in range(rating.segments):
         draws[f"b{i}"] = std * b[:, i]
         draws[f"hs{i}"] = hs[:, i]
-        labels[f"b{i}"] = f"b{i} (exponent)" if i == 0 else f"b{i} (exponent change at hs{i})"
-        labels[f"hs{i}"] = f"hs{i} (gage height of zero flow)" if i == 0 else f"hs{i} (breakpoint)"
+        labels[f"b{i}"] = "b0 (exponent)" if i == 0 else f"b{i} (exponent change above hs{i})"
+        labels[f"hs{i}"] = "hs0 (stage of zero flow)" if i == 0 else f"hs{i} (breakpoint)"
     order = ["a"] + [f"{k}{i}" for i in range(rating.segments) for k in ("b", "hs")]
-    return [
-        {
-            "name": labels[k],
-            "mean": float(np.mean(draws[k])),
-            "sd": float(np.std(draws[k])),
-            "lo": float(np.percentile(draws[k], 2.5)),
-            "hi": float(np.percentile(draws[k], 97.5)),
-        }
-        for k in order
-    ]
+    return [{"key": k, "name": labels[k], "mean": float(np.mean(draws[k])), "sd": float(np.std(draws[k])),
+             "lo": float(np.percentile(draws[k], 2.5)), "hi": float(np.percentile(draws[k], 97.5))}
+            for k in order]
 
 
-def fit_site(site: dict, out_dir: Path, units: dict, seed: int) -> dict:
-    df = load_measurements(ROOT / site["file"])
-    segments = int(site.get("segments", 2))
-    q_sigma = df["q_sigma"] if "q_sigma" in df.columns and df["q_sigma"].notna().all() else None
+def rating_on_grid(rating: PowerLawRating, h: np.ndarray) -> pd.DataFrame:
+    """Median and ~95% range of discharge for each stage in h."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = rating.table(h=h)
+        lo = t["median"] / t["gse"] ** 2
+        hi = t["median"] * t["gse"] ** 2
+    t = t.assign(q_lower_95=lo.fillna(0.0), q_upper_95=hi.fillna(0.0))
+    return t.fillna({"median": 0.0, "discharge": 0.0})
+
+
+def nice_step(span: float, n: int = 400) -> float:
+    raw = max(span, 1e-6) / n
+    mag = 10 ** math.floor(math.log10(raw))
+    return min((s * mag for s in (1, 2, 5, 10) if s * mag >= raw), default=raw)
+
+
+def fit_gauge(site: dict, ddir: Path, out_dir: Path, defaults: dict, seed: int) -> dict:
+    if (ddir / "error.txt").exists():
+        raise RuntimeError("USGS download failed: " + (ddir / "error.txt").read_text())
+    if not (ddir / "measurements.csv").exists():
+        raise RuntimeError("no data downloaded yet — run scripts/fetch_usgs.py first")
+
+    info = json.loads((ddir / "site.json").read_text())
+    meas = pd.read_csv(ddir / "measurements.csv", parse_dates=["time"])
+    daily = pd.read_csv(ddir / "daily.csv") if (ddir / "daily.csv").exists() else pd.DataFrame(
+        columns=["date", "stage"])
+    segments = int(site.get("segments", defaults.get("segments", 2)))
+
+    meas = meas.dropna(subset=["stage", "q"])
+    n_dry_meas = int((meas["q"] <= 0).sum())  # dry visits can't enter a power-law fit
+    meas = meas[meas["q"] > 0].sort_values("time").reset_index(drop=True)
+    if len(meas) < 5:
+        raise ValueError(f"only {len(meas)} usable field measurements; need at least 5")
+    q_sigma = meas["q_sigma"] if "q_sigma" in meas and meas["q_sigma"].notna().all() else None
 
     rating = PowerLawRating(segments=segments)
-    rating.fit(h=df["stage"], q=df["q"], q_sigma=q_sigma, progressbar=False, random_seed=seed)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Rating curve plot
-    fig, ax = plt.subplots(figsize=(7, 6))
-    rating.plot(ax=ax)
-    ax.set_xlabel(f"Discharge ({units['discharge']})")
-    ax.set_ylabel(f"Stage ({units['stage']})")
-    ax.set_title(site["name"], fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out_dir / "rating.png", dpi=150)
-    plt.close(fig)
-
-    # Residuals plot
-    fig, ax = plt.subplots(figsize=(7, 4))
-    rating.plot_residuals(ax=ax)
-    ax.set_ylabel(f"Stage ({units['stage']})")
-    fig.tight_layout()
-    fig.savefig(out_dir / "residuals.png", dpi=150)
-    plt.close(fig)
-
-    # Rating table (full resolution CSV)
-    table = rating.table()
-    lo95 = table["median"] / table["gse"] ** 2
-    hi95 = table["median"] * table["gse"] ** 2
-    table = table.assign(q_lower_95=lo95, q_upper_95=hi95)
-    table.to_csv(out_dir / "rating_table.csv", index=False, float_format="%.4f")
-
-    # Parameters in real (denormalized) units, per posterior draw:
-    #   ln(Q) = a + sum_i b_i * ln(max(h - hs_i, 0) + ho_i),  ho_0 = 0, ho_i = 1
+    rating.fit(h=meas["stage"], q=meas["q"], q_sigma=q_sigma, progressbar=False, random_seed=seed)
     params = posterior_params(rating)
+    hs0 = next(p["mean"] for p in params if p["key"] == "hs0")
 
-    rating.save(str(out_dir / "rating_fit.nc"))
-    df.to_csv(out_dir / "measurements.csv", index=False)
+    # ---- one fine grid covering both the measurements and the daily water levels
+    m_lo, m_hi = float(meas["stage"].min()), float(meas["stage"].max())
+    d_stage = pd.to_numeric(daily["stage"], errors="coerce")
+    lo = min(m_lo, float(d_stage.min()) if d_stage.notna().any() else m_lo)
+    hi = max(m_hi + 0.1 * (m_hi - m_lo), float(d_stage.max()) if d_stage.notna().any() else m_hi)
+    lo = max(lo, hs0 + 1e-3)
+    step = nice_step(hi - lo)
+    grid = np.round(np.arange(lo, hi + step, step), 6)
+    tab = rating_on_grid(rating, grid)
 
-    result = {
-        "id": site["id"],
-        "name": site["name"],
-        "segments": segments,
-        "n_obs": len(df),
-        "stage_range": [float(df["stage"].min()), float(df["stage"].max())],
-        "q_range": [float(df["q"].min()), float(df["q"].max())],
-        "used_q_sigma": q_sigma is not None,
-        "params": params,
-        "equation": "ln(Q) = a + Σ b_i · ln(max(h − hs_i, 0) + ho_i), ho_0 = 0, ho_i = 1 for i > 0",
+    # ---- streamflow estimated from daily water levels
+    daily = daily[["date"]].assign(stage=d_stage)
+    has_stage = daily["stage"].notna()
+    for col, src in (("q_est", "median"), ("q_est_lo", "q_lower_95"), ("q_est_hi", "q_upper_95")):
+        daily[col] = np.where(has_stage, np.interp(daily["stage"].fillna(lo), tab["stage"], tab[src]), np.nan)
+        daily.loc[has_stage & (daily["stage"] <= hs0), col] = 0.0
+    daily["extrapolated"] = has_stage & ((daily["stage"] > m_hi) | (daily["stage"] < m_lo))
+
+    # Headwater streams can run dry: below the zero-flow stage (hs0) flow is 0.
+    est = daily.dropna(subset=["q_est"])
+    no_flow = {"days": int((est["q_est"] <= 0).sum()), "of": int(len(est)), "dry_measurements": n_dry_meas}
+
+    # ---- downloads
+    out_dir.mkdir(parents=True, exist_ok=True)
+    table = rating_on_grid(rating, np.round(np.arange(lo, m_hi + 0.1 * (m_hi - m_lo) + 0.01, 0.01), 2))
+    table.rename(columns={"discharge": "mean"}).to_csv(out_dir / "rating_table.csv", index=False, float_format="%.4f")
+    daily.to_csv(out_dir / "daily_streamflow.csv", index=False, float_format="%.4f")
+    meas.to_csv(out_dir / "field_measurements.csv", index=False)
+    summary = {
+        "usgs_id": info["site_no"], "name": site.get("name") or info["usgs_name"], "segments": segments,
+        "n_measurements": len(meas), "measurements_since": info.get("measurements_since"),
+        "params": params, "no_flow": no_flow, "zero_flow_stage": hs0,
+        "data_through": str(daily.loc[has_stage, "date"].max()) if has_stage.any() else None,
+        "equation": "ln(Q) = a + Σ b_i · ln(max(h − hs_i, 0) + ho_i); ho_0 = 0, ho_i = 1 for i > 0",
     }
-    (out_dir / "params.json").write_text(json.dumps(result, indent=2))
-    return {"result": result, "table": table, "measurements": df}
+    (out_dir / "rating_parameters.json").write_text(json.dumps(summary, indent=2))
+
+    # ---- compact data for the browser charts
+    def r(x, nd=3):
+        return None if x is None or (isinstance(x, float) and not np.isfinite(x)) else round(float(x), nd)
+
+    curve = tab[(tab["stage"] >= lo) & (tab["stage"] <= hi)]
+    curve = curve.iloc[:: max(1, len(curve) // 250)]
+    chart = {
+        "daily": {
+            "t": daily["date"].astype(str).tolist(),
+            "stage": [r(v) for v in daily["stage"]],
+            "q": [r(v) for v in daily["q_est"]], "q_lo": [r(v) for v in daily["q_est_lo"]],
+            "q_hi": [r(v) for v in daily["q_est_hi"]],
+        },
+        "meas": {"t": meas["time"].dt.strftime("%Y-%m-%d").tolist(),
+                 "stage": [r(v) for v in meas["stage"]], "q": [r(v) for v in meas["q"]]},
+        "rating": {"stage": [r(v) for v in curve["stage"]], "q": [r(v) for v in curve["median"]],
+                   "lo": [r(v) for v in curve["q_lower_95"]], "hi": [r(v) for v in curve["q_upper_95"]]},
+        "measured_range": [m_lo, m_hi], "zero_flow_stage": r(hs0),
+    }
+    return {"site": site, "info": info, "summary": summary, "chart": chart, "meas": meas}
 
 
-# --------------------------------------------------------------------------- HTML
-CSS = """
-:root{--fg:#1d2733;--muted:#5d6b7a;--line:#dfe4ea;--bg:#f7f9fb;--accent:#1f6f8b;--bad:#b3261e}
-*{box-sizing:border-box}body{margin:0;font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--fg);background:var(--bg)}
-header{background:#fff;border-bottom:1px solid var(--line)}header .wrap{padding:20px 24px}
-header h1{margin:0;font-size:22px}header p{margin:4px 0 0;color:var(--muted)}
-.wrap{max-width:1040px;margin:0 auto;padding:24px}a{color:var(--accent)}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
-.card{background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden;text-decoration:none;color:inherit;display:block}
-.card:hover{border-color:var(--accent)}.card img{width:100%;display:block;border-bottom:1px solid var(--line)}
-.card .body{padding:12px 14px}.card h2{font-size:16px;margin:0 0 4px}.meta{color:var(--muted);font-size:13px}
-.err{border-color:var(--bad)}.err h2{color:var(--bad)}pre{white-space:pre-wrap;font-size:12px;background:#fbeaea;padding:8px;border-radius:6px}
-section{background:#fff;border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:18px}
-section h2{margin:0 0 10px;font-size:17px}.plots{display:grid;grid-template-columns:1fr;gap:12px}.plots img{max-width:100%;border:1px solid var(--line);border-radius:6px}
-table{border-collapse:collapse;width:100%;font-size:13.5px;font-variant-numeric:tabular-nums}
-th,td{padding:5px 10px;border-bottom:1px solid var(--line);text-align:right}th{background:#f1f4f7;position:sticky;top:0}
-th:first-child,td:first-child{text-align:left}.scroll{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:6px}
-.dl a{display:inline-block;margin:0 10px 6px 0;padding:6px 12px;border:1px solid var(--accent);border-radius:6px;text-decoration:none}
-.stats{display:flex;flex-wrap:wrap;gap:22px}.stats div b{display:block;font-size:18px}
-footer{color:var(--muted);font-size:12.5px;text-align:center;padding:10px 24px 30px}
-"""
+# =========================================================================== HTML
+def fmt_q(x) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    return f"{x:,.0f}" if x >= 100 else f"{x:,.1f}" if x >= 10 else f"{x:.2f}"
 
 
-def page(title: str, body: str, subtitle: str = "", root: str = "") -> str:
+def fmt_num(x, nd=3) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    s = f"{x:,.{nd}f}"
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def fmt_date(s: str) -> str:
+    try:
+        return dt.date.fromisoformat(str(s)[:10]).strftime("%b %-d, %Y")
+    except ValueError:
+        return str(s)
+
+
+LOGO = """<svg class="logo-mark" viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="19" fill="currentColor" opacity=".14"/>
+<path d="M6 22c4-4 8-4 12 0s8 4 12 0 4-2 4-2" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+<path d="M9 28c3.5-3 7-3 10.5 0s7 3 10.5 0" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" opacity=".7"/>
+<path d="M20 6l5 9h-10z" fill="currentColor"/></svg>"""
+
+
+def submit_button(cfg: dict, label: str = "Submit a reading") -> str:
+    url = (cfg["site"].get("submit_url") or "").strip()
+    if url:
+        return f'<a class="btn btn-accent" href="{esc(url)}">{esc(label)}</a>'
+    return f'<span class="btn btn-accent disabled" title="Set submit_url in sites.yml">{esc(label)}</span>'
+
+
+def layout(cfg: dict, title: str, body: str, root: str, active: str = "") -> str:
+    s = cfg["site"]
+    nav = [("Map", f"{root}index.html#map"), ("Staff gauges", f"{root}index.html#staff"),
+           ("How it works", f"{root}index.html#how")]
+    links = "".join(f'<a href="{h}"{" class=active" if n == active else ""}>{n}</a>' for n, h in nav)
+    built = dt.datetime.now(dt.timezone.utc).strftime("%b %-d, %Y")
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)}</title><link rel="stylesheet" href="{root}style.css"></head>
-<body><header><div class="wrap"><h1>{esc(title)}</h1>{f'<p>{subtitle}</p>' if subtitle else ''}</div></header>
-<main class="wrap">{body}</main>
-<footer>Fit with <a href="https://github.com/thodson-usgs/ratingcurve">ratingcurve</a> {esc(ratingcurve.__version__ if hasattr(ratingcurve, '__version__') else '')}
-(Hodson et al., 2024, <a href="https://doi.org/10.3390/hydrology11020014">Hydrology 11(2):14</a>) ·
-built {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC. Provisional — review before operational use.</footer>
+<title>{esc(title)}</title>
+<link rel="stylesheet" href="{root}assets/vendor/leaflet/leaflet.css"><link rel="stylesheet" href="{root}assets/site.css">
+</head><body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="demo-bar">Concept demo · <a href="{root}index.html#about">about this site</a></div>
+<header class="site-header"><div class="container nav-row">
+<a class="brand" href="{root}index.html">{LOGO}<span>{esc(s['title'])}</span></a>
+<nav class="main-nav">{links}</nav>
+<a class="btn btn-accent nav-cta" href="{root}index.html#staff">Submit a reading</a>
+</div></header>
+<main id="main">{body}</main>
+<footer class="site-footer"><div class="container footer-grid">
+<div><a class="brand brand-light" href="{root}index.html">{LOGO}<span>{esc(s['title'])}</span></a>
+<p>{esc(s.get('intro', ''))}</p></div>
+<div><h4>Data</h4><ul><li><a href="https://waterdata.usgs.gov/">USGS Water Data</a></li>
+<li><a href="https://github.com/thodson-usgs/ratingcurve">ratingcurve</a> (<a href="https://doi.org/10.3390/hydrology11020014">Hodson et al., 2024</a>)</li>
+<li>Basemap © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, © <a href="https://carto.com/attributions">CARTO</a></li></ul></div>
+<div><h4>About</h4><p>{esc(s.get('disclaimer', ''))}</p><p class="muted">Built {built}.</p></div>
+</div></footer>
+<script src="{root}assets/vendor/leaflet/leaflet.js"></script>
+<script src="{root}assets/vendor/chart.umd.min.js"></script>
+<script src="{root}assets/vendor/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="{root}assets/site.js"></script>
 </body></html>"""
 
 
-def fmt(x: float, nd: int = 3) -> str:
-    if x is None or not np.isfinite(x):
-        return "—"
-    return f"{x:,.0f}" if abs(x) >= 1000 else f"{x:.{nd}g}" if abs(x) < 1 else f"{x:,.{nd}f}".rstrip("0").rstrip(".")
+def home_page(cfg: dict, gauges: list[dict]) -> str:
+    s = cfg["site"]
+    ok = [g for g in gauges if "error" not in g]
+    n_meas = sum(g["summary"]["n_measurements"] for g in ok)
+    ends = [g["summary"]["data_through"] for g in ok if g["summary"]["data_through"]]
+
+    markers, items = [], []
+    for g in gauges:
+        site = g["site"]
+        gid = str(site["usgs_id"])
+        if "error" in g:
+            items.append(f"""<li class="gauge-item error"><div><b>{esc(site.get('name', gid))}</b>
+<span class="muted small">Not built on the last run: {esc(g['error'])}</span></div></li>""")
+            continue
+        sm, info = g["summary"], g["info"]
+        markers.append({"name": sm["name"], "lat": info["lat"], "lon": info["lon"], "region": site.get("region", ""),
+                        "url": f"gauges/{gid}/index.html"})
+        items.append(f"""<li class="gauge-item"><a href="gauges/{gid}/index.html"><div><b>{esc(sm['name'])}</b>
+<span class="muted small">{esc(site.get('region', ''))}</span></div><span class="arrow">→</span></a></li>""")
+
+    body = f"""
+<section class="hero"><div class="container hero-inner">
+<p class="eyebrow light">Massachusetts river flow</p>
+<h1>{esc(s['tagline'])}</h1>
+<p class="lead">{esc(s.get('intro', ''))}</p>
+<p><a class="btn btn-accent" href="#map">Explore the map</a> <a class="btn btn-ghost" href="#staff">Visit a staff gauge</a></p>
+<dl class="hero-stats"><div><dt>Gauges</dt><dd>{len(ok)}</dd></div><div><dt>Flow measurements</dt><dd>{n_meas:,}</dd></div>
+<div><dt>Data through</dt><dd>{fmt_date(max(ends)) if ends else '—'}</dd></div></dl>
+</div><svg class="hero-wave" viewBox="0 0 1440 80" preserveAspectRatio="none" aria-hidden="true">
+<path d="M0 40c160-30 320-30 480 0s320 30 480 0 320-30 480 0V80H0z"/></svg></section>
+
+<section id="map" class="section"><div class="container">
+<p class="eyebrow">Explore your rivers</p><h2>Gauges</h2>
+<div class="map-layout"><div id="home-map" class="map map-lg" role="region" aria-label="Map of gauges"></div>
+<ul class="gauge-list">{''.join(items)}</ul></div>
+</div></section>
+
+<section id="staff" class="section cta"><div class="container cta-inner">
+<div><p class="eyebrow light">Get involved</p><h2>Visit a staff gauge</h2>
+<p>Each site has a staff gauge, a ruler in the river. Read the water level where the surface meets the gauge and send it in.
+Your readings check the loggers and fill gaps between downloads. Dry? Report that too.</p></div>
+<div>{submit_button(cfg)}</div>
+</div></section>
+
+<section id="how" class="section"><div class="container">
+<p class="eyebrow">How it works</p><h2>From water level to streamflow</h2>
+<div class="pillars">
+<div class="pillar"><span class="num">1</span><h3>Record</h3><p>Loggers in the river record water level. Volunteers download them a few times a year.</p></div>
+<div class="pillar"><span class="num">2</span><h3>Read</h3><p>Visitors read the staff gauge and submit readings, a check on the loggers.</p></div>
+<div class="pillar"><span class="num">3</span><h3>Fit</h3><p>Flow measurements build a rating curve with <a href="https://github.com/thodson-usgs/ratingcurve">ratingcurve</a>,
+which turns water level into streamflow, with uncertainty.</p></div>
+</div></div></section>
+
+<section id="about" class="section alt"><div class="container narrow">
+<p class="eyebrow">About this demo</p>
+<p>This prototype uses USGS streamgage data in place of logger records. Streamflow updates whenever new logger data are added.
+Many headwater streams run dry part of the year; those days show as zero flow.</p>
+<p class="muted small">{esc(s.get('disclaimer', ''))}</p></div></section>
+<script type="application/json" id="home-data">{json.dumps(markers)}</script>"""
+    return layout(cfg, f"{s['title']} — River flow across Massachusetts", body, root="", active="Map")
 
 
-def site_page(fit: dict, units: dict, title: str) -> str:
-    r, table, meas = fit["result"], fit["table"], fit["measurements"]
-    su, qu = units["stage"], units["discharge"]
+def gauge_page(cfg: dict, g: dict) -> str:
+    u, site, info, sm = cfg["units"], g["site"], g["info"], g["summary"]
+    su, qu = u["stage"], u["discharge"]
+    gid = info["site_no"]
+    nf = sm["no_flow"]
+    loc = ", ".join(x for x in [info.get("county"), "MA"] if x)
 
-    stats = f"""<div class="stats">
-<div><b>{r['n_obs']}</b><span class="meta">measurements</span></div>
-<div><b>{r['segments']}</b><span class="meta">segments</span></div>
-<div><b>{fmt(r['stage_range'][0])}–{fmt(r['stage_range'][1])} {esc(su)}</b><span class="meta">measured stage</span></div>
-<div><b>{fmt(r['q_range'][0])}–{fmt(r['q_range'][1])} {esc(qu)}</b><span class="meta">measured discharge</span></div>
-<div><b>{'yes' if r['used_q_sigma'] else 'no'}</b><span class="meta">measurement uncertainty used</span></div></div>"""
+    rows = [
+        ("Gauge ID", esc(gid)),
+        ("Location", esc(loc)),
+        ("Coordinates", f"{info['lat']:.5f}, {info['lon']:.5f}" if info.get("lat") is not None else "—"),
+        ("Drainage area", f"{info['drainage_area_mi2']:,.1f} mi²" if info.get("drainage_area_mi2") else "—"),
+        ("Data through", fmt_date(sm["data_through"]) if sm["data_through"] else "—"),
+        ("Flow measurements", f"{sm['n_measurements']}"
+         + (f" + {nf['dry_measurements']} dry visits" if nf["dry_measurements"] else "")),
+        ("No-flow days", f"{nf['days']:,} of {nf['of']:,}" if nf["of"] else "—"),
+    ]
+    info_rows = "".join(f"<div><dt>{k}</dt><dd>{v}</dd></div>" for k, v in rows)
+    staff_note = site.get("staff_gauge") or "Find the staff gauge at the marked spot on the map."
 
-    prow = "".join(
-        f"<tr><td>{esc(p['name'])}</td><td>{fmt(p['mean'],4)}</td><td>{fmt(p['sd'],3)}</td>"
-        f"<td>{fmt(p['lo'],4)} – {fmt(p['hi'],4)}</td></tr>" for p in r["params"])
-    ptable = f"""<table><thead><tr><th>Parameter</th><th>Mean</th><th>SD</th><th>95% interval</th></tr></thead>
-<tbody>{prow}</tbody></table>
-<p class="meta">Model (segmented power law): <code>{esc(r['equation'])}</code>, with h and hs in {esc(su)}
-and Q in {esc(qu)}. Each b<sub>i</sub> after the first is the change in exponent above breakpoint hs<sub>i</sub>,
-so the exponent of the top segment is b0 + b1 + …</p>"""
+    prow = "".join(f"<tr><td>{esc(p['name'])}</td><td>{fmt_num(p['mean'], 3)}</td>"
+                   f"<td>{fmt_num(p['lo'], 3)} – {fmt_num(p['hi'], 3)}</td></tr>" for p in sm["params"])
+    mrows = "".join(f"<tr><td>{t.strftime('%Y-%m-%d')}</td><td>{fmt_num(h, 2)}</td><td>{fmt_q(q)}</td></tr>"
+                    for t, h, q in zip(g["meas"]["time"], g["meas"]["stage"], g["meas"]["q"]))
+    data = dict(g["chart"], units=u, name=sm["name"], lat=info.get("lat"), lon=info.get("lon"))
 
-    # Show rating table at ~0.1 stage increments; full 0.01 table is in the CSV.
-    step = max(1, len(table) // 120)
-    shown = table.iloc[::step]
-    trows = "".join(
-        f"<tr><td>{row.stage:.2f}</td><td>{fmt(row.median)}</td><td>{fmt(row.discharge)}</td>"
-        f"<td>{fmt(row.q_lower_95)} – {fmt(row.q_upper_95)}</td><td>{row.gse:.4f}</td></tr>"
-        for row in shown.itertuples())
-    rtable = f"""<div class="scroll"><table><thead><tr><th>Stage ({esc(su)})</th><th>Median Q</th><th>Mean Q</th>
-<th>≈95% range</th><th>GSE</th></tr></thead><tbody>{trows}</tbody></table></div>
-<p class="meta">Discharge in {esc(qu)}. GSE = geometric standard error; the ≈95% range is median ÷ GSE² to median × GSE².
-Table extends 10% beyond the highest measurement — treat that extrapolation with caution.</p>"""
+    body = f"""
+<section class="page-head"><div class="container">
+<nav class="crumbs"><a href="../../index.html">Home</a> / <a href="../../index.html#map">Gauges</a> / <span>{esc(sm['name'])}</span></nav>
+<p class="eyebrow">{esc(site.get('region', ''))}</p><h1>{esc(sm['name'])}</h1>
+</div></section>
 
-    mcols = [c for c in ["datetime", "stage", "q", "q_sigma"] if c in meas.columns]
-    mhead = "".join(f"<th>{esc(c)}</th>" for c in mcols)
-    mrows = "".join("<tr>" + "".join(
-        f"<td>{esc(str(v)) if c == 'datetime' else fmt(float(v))}</td>" for c, v in zip(mcols, row)) + "</tr>"
-        for row in meas[mcols].itertuples(index=False))
+<section class="section tight"><div class="container gauge-top">
+<div class="panel"><h2 class="panel-title">Gauge info</h2><dl class="info">{info_rows}</dl>
+<div class="staff-box"><h3>Read the staff gauge</h3><p>{esc(staff_note)} Read the water level and submit it. If the stream is dry, report that too.</p>{submit_button(cfg)}</div></div>
+<div class="panel map-panel"><div id="gauge-map" class="map" role="region" aria-label="Gauge location map"></div></div>
+</div></section>
 
-    body = f"""<p><a href="../../index.html">← All sites</a></p>
-<section><h2>Summary</h2>{stats}
-<p class="dl" style="margin-top:14px"><a href="rating_table.csv" download>Rating table (CSV, 0.01 {esc(su)} steps)</a>
-<a href="params.json" download>Parameters (JSON)</a><a href="rating_fit.nc" download>Full posterior (NetCDF)</a>
-<a href="measurements.csv" download>Measurements (CSV)</a></p></section>
-<section><h2>Rating curve</h2><div class="plots"><img src="rating.png" alt="Fitted rating curve with measurements and uncertainty band">
-<img src="residuals.png" alt="Residuals by stage"></div>
-<p class="meta">Gray band: posterior uncertainty. Dotted lines: fitted segment breakpoints. Residuals should scatter
-evenly around zero; a systematic bend suggests trying another segment.</p></section>
-<section><h2>Fitted parameters</h2>{ptable}</section>
-<section><h2>Rating table</h2>{rtable}</section>
-<section><h2>Measurements</h2><div class="scroll"><table><thead><tr>{mhead}</tr></thead><tbody>{mrows}</tbody></table></div></section>"""
-    return page(r["name"], body, subtitle=esc(title), root="../../")
+<section class="section tight"><div class="container"><div class="panel">
+<div class="panel-head"><h2 class="panel-title">Gauge data</h2>
+<div class="tabs" role="tablist"><button role="tab" class="tab active" data-series="flow">Streamflow</button>
+<button role="tab" class="tab" data-series="level">Water level</button></div></div>
+<div class="toolbar"><div class="ranges" role="group" aria-label="Time range">
+<button data-range="30">1 month</button><button data-range="91">3 months</button><button data-range="182">6 months</button>
+<button data-range="365" class="active">1 year</button><button data-range="0">All</button></div>
+<label class="check"><input type="checkbox" id="flow-log"> Log scale</label></div>
+<div class="chart-box"><canvas id="ts-chart"></canvas></div>
+<p class="muted small" id="ts-note">Updated when the loggers are downloaded. Shading shows the ~95% range.
+Flow is 0 when the water level drops below the zero-flow stage ({fmt_num(sm['zero_flow_stage'], 2)} {esc(su)}), the dashed line on the water-level chart.</p>
+<p class="downloads"><a href="daily_streamflow.csv" download>Download data (CSV)</a></p>
+</div></div></section>
 
+<section class="section tight"><div class="container"><div class="panel">
+<div class="panel-head"><h2 class="panel-title">Rating curve</h2>
+<label class="check"><input type="checkbox" id="rating-log" checked> Log scale</label></div>
+<div class="rating-grid"><div class="chart-box tall"><canvas id="rating-chart"></canvas></div>
+<div>
+<table class="params"><thead><tr><th>Parameter</th><th>Mean</th><th>95% interval</th></tr></thead><tbody>{prow}</tbody></table>
+<p class="muted small"><code>{esc(sm['equation'])}</code></p>
+<p class="downloads"><a href="rating_table.csv" download>Rating table (CSV)</a><a href="rating_parameters.json" download>Parameters (JSON)</a></p>
+</div></div></div></div></section>
 
-def index_page(title: str, results: list[dict]) -> str:
-    cards = []
-    for item in results:
-        if "error" in item:
-            cards.append(f"""<div class="card err"><div class="body"><h2>{esc(item['name'])}</h2>
-<p class="meta">Fit failed — fix the data or settings in sites.yml and push again.</p><pre>{esc(item['error'])}</pre></div></div>""")
-        else:
-            r = item["result"]
-            cards.append(f"""<a class="card" href="sites/{esc(r['id'])}/index.html"><img src="sites/{esc(r['id'])}/rating.png" alt="">
-<div class="body"><h2>{esc(r['name'])}</h2><div class="meta">{r['n_obs']} measurements · {r['segments']} segment(s)</div></div></a>""")
-    body = f'<div class="cards">{"".join(cards)}</div>'
-    return page(title, body, subtitle="Segmented power-law stage–discharge ratings, refit automatically when data change.")
+<section class="section tight last"><div class="container"><div class="panel">
+<details><summary><h2 class="panel-title">Flow measurements ({sm['n_measurements']})</h2></summary>
+<div class="scroll"><table><thead><tr><th>Date</th><th>Water level ({esc(su)})</th><th>Streamflow ({esc(qu)})</th></tr></thead>
+<tbody>{mrows}</tbody></table></div>
+<p class="downloads"><a href="field_measurements.csv" download>Download (CSV)</a></p></details>
+</div></div></section>
+<script type="application/json" id="gauge-data">{json.dumps(data)}</script>"""
+    return layout(cfg, f"{sm['name']} — {cfg['site']['title']}", body, root="../../")
 
 
-# --------------------------------------------------------------------------- main
+# =========================================================================== main
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(ROOT / "sites.yml"))
+    ap.add_argument("--data", default=str(ROOT / "data" / "usgs"))
     ap.add_argument("--out", default=str(ROOT / "_site"))
-    ap.add_argument("--only", help="fit only this site id")
+    ap.add_argument("--only", help="build only this USGS site number")
     ap.add_argument("--seed", type=int, default=2024)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
-    title = cfg.get("title", "Rating Curves")
-    units = {"stage": "ft", "discharge": "ft³/s", **(cfg.get("units") or {})}
+    cfg.setdefault("site", {}).setdefault("title", "River Flow")
+    cfg["site"].setdefault("tagline", cfg["site"]["title"])
+    cfg["units"] = {"stage": "ft", "discharge": "ft³/s", **(cfg.get("units") or {})}
+    cfg["defaults"] = cfg.get("defaults") or {}
+
     out = Path(args.out)
     if out.exists():
         shutil.rmtree(out)
-    out.mkdir(parents=True)
-    (out / "style.css").write_text(CSS)
+    shutil.copytree(ROOT / "site_assets", out / "assets")
     (out / ".nojekyll").write_text("")
 
-    results, failures = [], 0
+    gauges, failures = [], 0
     for site in cfg["sites"]:
-        if args.only and site["id"] != args.only:
+        gid = str(site["usgs_id"]).strip()
+        if args.only and gid != args.only:
             continue
-        print(f"Fitting {site['id']} ...", flush=True)
-        site_dir = out / "sites" / site["id"]
+        print(f"Fitting USGS {gid} ...", flush=True)
+        gdir = out / "gauges" / gid
         try:
-            fit = fit_site(site, site_dir, units, args.seed)
-            (site_dir / "index.html").write_text(site_page(fit, units, title))
-            results.append(fit)
-        except Exception as exc:  # keep building the other sites
+            g = fit_gauge(site, Path(args.data) / gid, gdir, cfg["defaults"], args.seed)
+            (gdir / "index.html").write_text(gauge_page(cfg, g))
+            gauges.append(g)
+            nf = g["summary"]["no_flow"]
+            print(f"  ok: {g['summary']['n_measurements']} measurements, {nf['days']} no-flow days")
+        except Exception as exc:
             failures += 1
             traceback.print_exc()
-            print(f"::error title=Rating fit failed ({site['id']})::{exc}")
-            results.append({"name": site.get("name", site["id"]), "error": f"{type(exc).__name__}: {exc}"})
+            print(f"::warning title=Gauge {gid} not built::{exc}")
+            gauges.append({"site": site, "error": f"{type(exc).__name__}: {exc}"})
 
-    (out / "index.html").write_text(index_page(title, results))
-    print(f"Wrote {out} ({len(results) - failures} ok, {failures} failed)")
+    (out / "index.html").write_text(home_page(cfg, gauges))
+    print(f"Wrote {out} ({len(gauges) - failures} gauges ok, {failures} failed)")
     return 0
 
 

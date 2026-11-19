@@ -1,24 +1,55 @@
-# One entry per gage. Each entry points at a CSV in data/ with columns:
-#   stage    (required)  water-surface elevation / gage height
-#   q        (required)  measured discharge
-#   q_sigma  (optional)  1-sigma uncertainty of each discharge measurement
-#   datetime (optional)  shown in the measurement table only
+# Site settings and the list of gages.
 #
-# segments: number of power-law segments (control changes) to fit.
-#   Start with 1-2; add one if the residuals plot shows a bend the curve misses.
+# Each gage is a USGS streamgage number. On every run, GitHub Actions downloads its
+# field measurements, daily water levels and published flows from the USGS Water Data
+# APIs, fits a rating curve with ratingcurve, and rebuilds the website.
 
-title: Streamflow Rating Curves
+site:
+  title: Mass River Flow
+  tagline: Know how your river flows.
+  intro: Water levels from gauges across Massachusetts, turned into streamflow.
+  # Link for the "Submit a reading" buttons (e.g. a Google Form). Leave blank to show
+  # the button greyed out.
+  submit_url: ""
+  # Shown in the footer. Keep this line while the site is a demo.
+  disclaimer: >-
+    Concept demo prepared for Massachusetts Rivers Alliance. Not an official
+    Massachusetts Rivers Alliance product. Data are provisional.
+
 units:
   stage: ft
   discharge: ft³/s
 
-sites:
-  - id: green-channel
-    name: Green River (channel control) — demo data
-    file: data/green_channel.csv
-    segments: 2
+defaults:
+  segments: 2                       # power-law segments (control changes)
+  measurements_since: "2015-10-01"  # older measurements may predate channel changes
+  timeseries_years: 3               # years of daily water levels to show
 
-  - id: provo-natural
-    name: Provo River (natural control) — demo data
-    file: data/provo_natural.csv
-    segments: 2
+# Optional per gage: staff_gauge: "Downstream side of the Elm St bridge, river left."
+# describes where visitors can find the staff gauge.
+
+sites:
+  - usgs_id: "01104500"
+    name: Charles River at Waltham
+    river: Charles River
+    region: Greater Boston
+
+  - usgs_id: "01097000"
+    name: Assabet River at Maynard
+    river: Assabet River
+    region: Metrowest
+
+  - usgs_id: "01105000"
+    name: Neponset River at Norwood
+    river: Neponset River
+    region: South Shore
+
+  - usgs_id: "01171500"
+    name: Mill River at Northampton
+    river: Mill River
+    region: Pioneer Valley
+
+  - usgs_id: "01197500"
+    name: Housatonic River near Great Barrington
+    river: Housatonic River
+    region: Berkshires
