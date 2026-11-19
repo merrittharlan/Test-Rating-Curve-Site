@@ -3,13 +3,7 @@ name: Fit rating curves and publish site
 on:
   push:
     branches: [main]
-    paths:
-      - "data/**"
-      - "sites.yml"
-      - "scripts/**"
-      - "requirements.txt"
-      - ".github/workflows/build-ratings.yml"
-  workflow_dispatch:   # "Run workflow" button on the Actions tab
+  workflow_dispatch:        # "Run workflow" button on the Actions tab
 
 permissions:
   contents: read
@@ -32,8 +26,13 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install ratingcurve
+      - name: Install ratingcurve and dataretrieval
         run: pip install -r requirements.txt
+
+      - name: Download gage data from USGS
+        env:
+          API_USGS_PAT: ${{ secrets.API_USGS_PAT }}   # optional; leave unset if you don't have one
+        run: python scripts/fetch_usgs.py
 
       - name: Fit ratings and build site
         run: python scripts/build_site.py --out _site
