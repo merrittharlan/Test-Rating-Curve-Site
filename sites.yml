@@ -6,7 +6,7 @@
 
 site:
   title: Mass River Flow
-  tagline: Know how your river flows.
+  tagline: Water levels and estimated flow for small streams.
   intro: Water levels from gauges across Massachusetts, turned into streamflow.
   # Link for the "Submit a reading" buttons (e.g. a Google Form). Leave blank to show
   # the button greyed out.
