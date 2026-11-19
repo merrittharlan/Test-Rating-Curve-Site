@@ -1,0 +1,24 @@
+# One entry per gage. Each entry points at a CSV in data/ with columns:
+#   stage    (required)  water-surface elevation / gage height
+#   q        (required)  measured discharge
+#   q_sigma  (optional)  1-sigma uncertainty of each discharge measurement
+#   datetime (optional)  shown in the measurement table only
+#
+# segments: number of power-law segments (control changes) to fit.
+#   Start with 1-2; add one if the residuals plot shows a bend the curve misses.
+
+title: Streamflow Rating Curves
+units:
+  stage: ft
+  discharge: ft³/s
+
+sites:
+  - id: green-channel
+    name: Green River (channel control) — demo data
+    file: data/green_channel.csv
+    segments: 2
+
+  - id: provo-natural
+    name: Provo River (natural control) — demo data
+    file: data/provo_natural.csv
+    segments: 2

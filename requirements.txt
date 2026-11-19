@@ -1,0 +1,4 @@
+ratingcurve>=1.1
+matplotlib
+pandas
+pyyaml
