@@ -3,8 +3,9 @@
   "use strict";
   const COLORS = { site: "#1d6e8f", none: "#9aa5ab" };
   const RIVER = "#1d6e8f", NAVY = "#0e2f44", LEAF = "#5f9131";
-  const TILE_URL = "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png";
-  const TILE_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>';
+  // USGS National Map basemaps: public domain, no API key needed.
+  const TNM = (svc) => `https://basemap.nationalmap.gov/arcgis/rest/services/${svc}/MapServer/tile/{z}/{y}/{x}`;
+  const TNM_ATTR = 'Basemap: <a href="https://www.usgs.gov/programs/national-geospatial-program/national-map">USGS The National Map</a>';
 
   const readJSON = (id) => { const el = document.getElementById(id); return el ? JSON.parse(el.textContent) : null; };
   const fmtQ = (x) => x == null ? "—" : x >= 100 ? Math.round(x).toLocaleString() : x >= 10 ? x.toFixed(1) : x.toFixed(2);
@@ -18,7 +19,10 @@
 
   function baseMap(el, opts) {
     const map = L.map(el, Object.assign({ scrollWheelZoom: false }, opts || {}));
-    L.tileLayer(TILE_URL, { attribution: TILE_ATTR, subdomains: "abcd", maxZoom: 19 }).addTo(map);
+    const opt = { attribution: TNM_ATTR, maxNativeZoom: 16, maxZoom: 18 };
+    const topo = L.tileLayer(TNM("USGSTopo"), opt).addTo(map);
+    const imagery = L.tileLayer(TNM("USGSImageryTopo"), opt);
+    L.control.layers({ "Topographic": topo, "Imagery": imagery }, null, { position: "topright" }).addTo(map);
     return map;
   }
   function marker(lat, lon, cond, r) {
